@@ -1,15 +1,14 @@
 import torch
 import torch.nn as nn
 import numpy as np
-import json
-import subprocess
+from tqdm import tqdm
 from transformers import T5Tokenizer, T5EncoderModel
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 PROTT5 = "Rostlab/prot_t5_xl_uniref50"
 
 # =========================
-# FASTA READER
+# FASTA
 # =========================
 
 def read_fasta(path):
@@ -17,6 +16,7 @@ def read_fasta(path):
     current = None
     for line in open(path):
         line = line.strip()
+        if not line: continue
         if line.startswith(">"):
             pid = line.split("|")[1] if "|" in line else line[1:].split()[0]
             current = pid
@@ -25,6 +25,54 @@ def read_fasta(path):
             seqs[current] += line.strip()
     return seqs
 
+# =========================
+# GO PARSER
+# =========================
+
+def parse_go_obo(path):
+    parents = {}
+    namespace = {}
+    cur = None
+    for line in open(path):
+        line = line.strip()
+        if line == "[Term]":
+            cur = None
+        elif line.startswith("id:"):
+            cur = line.split("id:")[1].strip()
+            parents[cur] = []
+        elif cur and line.startswith("namespace:"):
+            namespace[cur] = line.split("namespace:")[1].strip()
+        elif cur and line.startswith("is_a:"):
+            p = line.split("is_a:")[1].split("!")[0].strip()
+            parents[cur].append(p)
+    return parents, namespace
+
+# =========================
+# GO PROPAGATION
+# =========================
+
+def propagate(scores, parents):
+    out = dict(scores)
+    for go, sc in list(scores.items()):
+        stack = [go]
+        while stack:
+            g = stack.pop()
+            for p in parents.get(g, []):
+                if p not in out or out[p] < sc:
+                    out[p] = sc
+                    stack.append(p)
+    return out
+
+# =========================
+# DATASET
+# =========================
+
+def load_train_terms(path):
+    ann = {}
+    for line in open(path):
+        pid, go, ont = line.strip().split("\t")
+        ann.setdefault(pid, set()).add(go)
+    return ann
 
 # =========================
 # ProtT5 EMBEDDER
@@ -44,144 +92,116 @@ class ProtT5Embedder:
         emb = out.last_hidden_state.mean(dim=1)
         return emb[0].cpu()
 
-
 # =========================
 # MODEL
 # =========================
-
-class SimpleGOModel(nn.Module):
+class GOModel(nn.Module):
     def __init__(self, in_dim, out_dim):
         super().__init__()
         self.net = nn.Sequential(
             nn.Linear(in_dim, 2048),
             nn.ReLU(),
             nn.Dropout(0.3),
-            nn.Linear(2048, out_dim),
-            nn.Sigmoid()
+            nn.Linear(2048, out_dim)
         )
 
     def forward(self, x):
-        return self.net(x)
-
-
-# =========================
-# GO GRAPH
-# =========================
-
-class GOGraph:
-    def __init__(self, parents_json):
-        self.parents = json.load(open(parents_json))
-
-    def propagate(self, scores):
-        out = dict(scores)
-        for go, score in scores.items():
-            stack = [go]
-            while stack:
-                g = stack.pop()
-                for p in self.parents.get(g, []):
-                    if p not in out or out[p] < score:
-                        out[p] = score
-                        stack.append(p)
-        return out
-
+        return torch.sigmoid(self.net(x))
 
 # =========================
-# MMSEQS HOMOLOGY (VERY SIMPLE VERSION)
-# =========================
-
-def mmseqs_predict(fasta_path):
-    """
-    This function should:
-    - Run mmseqs
-    - Find nearest neighbors
-    - Transfer their GO terms
-    - Return: dict(go -> score)
-    """
-
-    # TODO: Replace with real MMseqs pipeline
-    return {}  # empty fallback
-
-
-# =========================
-# MAIN PREDICTOR
-# =========================
-
-class CAFAPredictor:
-    def __init__(self, models, go_index, go_graph):
-        self.embedder = ProtT5Embedder()
-        self.models = models
-        self.go_index = go_index
-        self.go_graph = go_graph
-
-    def predict_one(self, pid, seq):
-        emb = self.embedder.embed(seq).unsqueeze(0)
-
-        # Ensemble NN
-        preds = []
-        for model in self.models:
-            with torch.no_grad():
-                preds.append(model(emb))
-        nn_pred = torch.stack(preds).mean(dim=0)[0].cpu().numpy()
-
-        nn_scores = {
-            self.go_index[str(i)]: float(nn_pred[i])
-            for i in range(len(nn_pred))
-        }
-
-        # MMseqs
-        fasta = f"/tmp/{pid}.fasta"
-        with open(fasta, "w") as f:
-            f.write(f">{pid}\n{seq}\n")
-
-        hom_scores = mmseqs_predict(fasta)
-
-        # Blend
-        final = dict(nn_scores)
-        for go, s in hom_scores.items():
-            final[go] = max(final.get(go, 0.0), s)
-
-        # GO propagation
-        final = self.go_graph.propagate(final)
-
-        return final
-
-
-# =========================
-# RUN
+# MAIN
 # =========================
 
 def main():
-    # Load data
-    seqs = read_fasta("Train/train_sequences.fasta")
+    print("Loading GO...")
+    parents, namespace = parse_go_obo("Train/go-basic.obo")
 
-    go_index = json.load(open("go_index.json"))  # index -> GO
-    go_graph = GOGraph("go_parents.json")
+    print("Loading train sequences...")
+    train_seqs = read_fasta("Train/train_sequences.fasta")
 
-    # Load ensemble models
-    models = [
-        torch.load("model_fold1.pt", map_location=DEVICE),
-        torch.load("model_fold2.pt", map_location=DEVICE),
-        torch.load("model_fold3.pt", map_location=DEVICE),
-    ]
+    print("Loading train labels...")
+    train_terms = load_train_terms("Train/train_terms.tsv")
 
-    for m in models:
-        m.eval()
+    print("Collecting GO vocabulary...")
+    all_gos = set()
+    for gos in train_terms.values():
+        all_gos |= gos
 
-    predictor = CAFAPredictor(models, go_index, go_graph)
+    go2idx = {go:i for i,go in enumerate(sorted(all_gos))}
+    idx2go = {i:go for go,i in go2idx.items()}
 
-    out = open("submission.txt", "w")
+    print("GO terms:", len(go2idx))
 
-    for pid, seq in seqs.items():
-        scores = predictor.predict_one(pid, seq)
+    print("Loading ProtT5...")
+    embedder = ProtT5Embedder()
 
-        # Write top-K predictions
-        for go, score in sorted(scores.items(), key=lambda x: -x[1])[:50]:
-            if score > 0.01:
-                out.write(f"{pid}\t{go}\t{score:.4f}\n")
+    X = []
+    Y = []
+
+    print("Embedding training sequences...")
+    for pid, seq in tqdm(train_seqs.items()):
+        if pid not in train_terms:
+            continue
+        emb = embedder.embed(seq)
+        y = torch.zeros(len(go2idx))
+        for go in train_terms[pid]:
+            if go in go2idx:
+                y[go2idx[go]] = 1.0
+        X.append(emb)
+        Y.append(y)
+
+    X = torch.stack(X)
+    Y = torch.stack(Y)
+
+    print("Train size:", X.shape)
+
+    model = GOModel(X.shape[1], Y.shape[1]).to(DEVICE)
+    opt = torch.optim.Adam(model.parameters(), lr=1e-4)
+    loss_fn = nn.BCELoss()
+
+    print("Training...")
+    for epoch in range(5):
+        model.train()
+        total = 0
+        for i in range(0, len(X), 8):
+            xb = X[i:i+8].to(DEVICE)
+            yb = Y[i:i+8].to(DEVICE)
+            pred = model(xb)
+            loss = loss_fn(pred, yb)
+            opt.zero_grad()
+            loss.backward()
+            opt.step()
+            total += loss.item()
+        print("Epoch", epoch, "loss", total)
+
+    torch.save(model.state_dict(), "model.pt")
+
+    print("Predicting test set...")
+    test_seqs = read_fasta("test/testsuperset.fasta")
+
+    out = open("submission.tsv", "w")
+
+    model.eval()
+
+    for pid, seq in tqdm(test_seqs.items()):
+        emb = embedder.embed(seq).unsqueeze(0).to(DEVICE)
+        with torch.no_grad():
+            pred = model(emb)[0].cpu().numpy()
+
+        scores = {}
+        for i, sc in enumerate(pred):
+            if sc > 0.01:
+                scores[idx2go[i]] = float(sc)
+
+        # GO propagation
+        scores = propagate(scores, parents)
+
+        # write top 100
+        for go, sc in sorted(scores.items(), key=lambda x: -x[1])[:100]:
+            out.write(f"{pid}\t{go}\t{sc:.4f}\n")
 
     out.close()
-    print("Done. Written to submission.txt")
-
+    print("Done. Written submission.tsv")
 
 if __name__ == "__main__":
     main()
