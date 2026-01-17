@@ -3,6 +3,7 @@ import torch.nn as nn
 import numpy as np
 from tqdm import tqdm
 from transformers import T5Tokenizer, T5EncoderModel
+import argparse
 print("Using cuda:", torch.cuda.is_available())
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 PROTT5 = "Rostlab/prot_t5_xl_uniref50"
@@ -103,6 +104,10 @@ class GOModel(nn.Module):
 # MAIN
 # =========================
 def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--role', choices=['user', 'friend', 'both'], default='both', help='Which part to process: user (30%), friend (70%), or both')
+    args = parser.parse_args()
+    
     print("Loading GO...")
     parents, namespace = parse_go_obo("Train/go-basic.obo")
     print("Loading train sequences...")
@@ -120,68 +125,134 @@ def main():
     embedder = ProtT5Embedder()
     # 1. Filter valid sequences first
     valid_pids = [p for p in train_seqs if p in train_terms]
-    # 2. Sort by sequence length (Crucial for speed!)
-    # Processing similar lengths together reduces wasted padding computations
     valid_pids.sort(key=lambda x: len(train_seqs[x]), reverse=True)
-    X_list = []
-    Y_list = []
-    # 3. Define Batch Size (Tune this!)
-    # Start with 2. If you have a 24GB GPU (3090/4090), try 4 or 8. 
-    # If it crashes, go down to 1.
-    BATCH_SIZE = 2 
-    print(f"Embedding {len(valid_pids)} sequences in batches of {BATCH_SIZE}...")
-    # 4. Batch Processing Loop
-    for i in tqdm(range(0, len(valid_pids), BATCH_SIZE)):
-        batch_pids = valid_pids[i : i + BATCH_SIZE]
-        batch_seqs = [train_seqs[pid] for pid in batch_pids]
-        # Prepare sequences for ProtT5 (add spaces between residues)
-        batch_seqs_formatted = [" ".join(list(s)) for s in batch_seqs]
-        try:
-            # Tokenize the whole batch at once
-            # This automatically pads to the longest sequence IN THIS BATCH (not the whole dataset)
-            tokens = embedder.tokenizer(
-                batch_seqs_formatted, 
-                return_tensors="pt", 
-                padding=True, 
-                truncation=True, 
-                max_length=1024 # Limit very long seqs to prevent OOM
-            )
-            with torch.no_grad():
-                # Move entire batch to GPU
-                input_ids = tokens['input_ids'].to(DEVICE)
-                attention_mask = tokens['attention_mask'].to(DEVICE)
-                # Forward pass (this is the heavy part)
-                out = embedder.model(input_ids=input_ids, attention_mask=attention_mask)
-                # Extract embeddings (mean pooling ignoring padding)
-                # We use attention_mask to ensure we don't count padding zeros in the mean
-                embeddings = out.last_hidden_state
-                mask_expanded = attention_mask.unsqueeze(-1).expand(embeddings.size()).float()
-                sum_embeddings = torch.sum(embeddings * mask_expanded, 1)
-                sum_mask = torch.clamp(mask_expanded.sum(1), min=1e-9)
-                batch_embeddings = sum_embeddings / sum_mask
-                # Move back to CPU to save RAM
-                X_list.append(batch_embeddings.cpu())
-                # Prepare Labels for this batch
-                for pid in batch_pids:
-                    y = torch.zeros(len(go2idx))
-                    for go in train_terms[pid]:
-                        if go in go2idx:
-                            y[go2idx[go]] = 1.0
-                    Y_list.append(y)
-        except RuntimeError as e:
-            if "out of memory" in str(e):
-                print(f"Skipping batch {i} due to OOM (sequence too long)")
-                torch.cuda.empty_cache()
-            else:
-                raise e
-    # Stack results
-    X = torch.cat(X_list) # Use cat instead of stack for lists of tensors
-    Y = torch.stack(Y_list)
-    print("Train size:", X.shape)
-    # === CRITICAL: SAVE THIS SO YOU DON'T HAVE TO DO IT AGAIN ===
-    print("Saving embeddings to disk...")
-    torch.save(X, "train_embeddings.pt")
-    torch.save(Y, "train_labels.pt")
+    # Split valid_pids: 30% for user, 70% for friend
+    split_idx = int(0.7 * len(valid_pids))
+    friend_pids = valid_pids[:split_idx]
+    user_pids = valid_pids[split_idx:]
+    print(f"User will embed {len(user_pids)} sequences, friend will embed {len(friend_pids)} sequences")
+    def process_pids(pids, prefix):
+        X_list = []
+        Y_list = []
+        max_tokens_per_batch = 1000
+        batch_seqs = []
+        batch_pids = []
+        current_tokens = 0
+        print(f"Embedding {len(pids)} sequences for {prefix} with dynamic batching...")
+        for pid in tqdm(pids):
+            seq = train_seqs[pid]
+            seq_len = len(seq)  # Approximate tokens
+            if current_tokens + seq_len > max_tokens_per_batch and batch_seqs:
+                # Process current batch
+                try:
+                    batch_seqs_formatted = [" ".join(list(s)) for s in batch_seqs]
+                    tokens = embedder.tokenizer(
+                        batch_seqs_formatted, 
+                        return_tensors="pt", 
+                        padding=True, 
+                        truncation=True, 
+                        max_length=1024
+                    )
+                    with torch.no_grad():
+                        input_ids = tokens['input_ids'].to(DEVICE)
+                        attention_mask = tokens['attention_mask'].to(DEVICE)
+                        out = embedder.model(input_ids=input_ids, attention_mask=attention_mask)
+                        embeddings = out.last_hidden_state
+                        mask_expanded = attention_mask.unsqueeze(-1).expand(embeddings.size()).float()
+                        sum_embeddings = torch.sum(embeddings * mask_expanded, 1)
+                        sum_mask = torch.clamp(mask_expanded.sum(1), min=1e-9)
+                        batch_embeddings = sum_embeddings / sum_mask
+                        X_list.append(batch_embeddings.cpu())
+                        for pid in batch_pids:
+                            y = torch.zeros(len(go2idx))
+                            for go in train_terms[pid]:
+                                if go in go2idx:
+                                    y[go2idx[go]] = 1.0
+                            Y_list.append(y)
+                except RuntimeError as e:
+                    if "out of memory" in str(e):
+                        print(f"Skipping batch due to OOM")
+                        torch.cuda.empty_cache()
+                    else:
+                        raise e
+                # Reset batch
+                batch_seqs = []
+                batch_pids = []
+                current_tokens = 0
+            batch_seqs.append(seq)
+            batch_pids.append(pid)
+            current_tokens += seq_len
+        # Process remaining batch
+        if batch_seqs:
+            try:
+                batch_seqs_formatted = [" ".join(list(s)) for s in batch_seqs]
+                tokens = embedder.tokenizer(
+                    batch_seqs_formatted, 
+                    return_tensors="pt", 
+                    padding=True, 
+                    truncation=True, 
+                    max_length=1024
+                )
+                with torch.no_grad():
+                    input_ids = tokens['input_ids'].to(DEVICE)
+                    attention_mask = tokens['attention_mask'].to(DEVICE)
+                    out = embedder.model(input_ids=input_ids, attention_mask=attention_mask)
+                    embeddings = out.last_hidden_state
+                    mask_expanded = attention_mask.unsqueeze(-1).expand(embeddings.size()).float()
+                    sum_embeddings = torch.sum(embeddings * mask_expanded, 1)
+                    sum_mask = torch.clamp(mask_expanded.sum(1), min=1e-9)
+                    batch_embeddings = sum_embeddings / sum_mask
+                    X_list.append(batch_embeddings.cpu())
+                    for pid in batch_pids:
+                        y = torch.zeros(len(go2idx))
+                        for go in train_terms[pid]:
+                            if go in go2idx:
+                                y[go2idx[go]] = 1.0
+                        Y_list.append(y)
+            except RuntimeError as e:
+                if "out of memory" in str(e):
+                    print(f"Skipping final batch due to OOM")
+                    torch.cuda.empty_cache()
+                else:
+                    raise e
+        # Stack results
+        X = torch.cat(X_list)
+        Y = torch.stack(Y_list)
+        print(f"{prefix} size:", X.shape)
+        # Save
+        torch.save(X, f"{prefix}_train_embeddings.pt")
+        torch.save(Y, f"{prefix}_train_labels.pt")
+        return X, Y
+    
+    if args.role == 'user':
+        X_user, Y_user = process_pids(user_pids, "user")
+        print("Embedding done for user. Skipping training.")
+        return  # Exit without training
+    elif args.role == 'friend':
+        X_friend, Y_friend = process_pids(friend_pids, "friend")
+        print("Embedding done for friend. Skipping training.")
+        return  # Exit without training
+    else:  # both
+        import os
+        user_emb_file = "user_train_embeddings.pt"
+        user_lab_file = "user_train_labels.pt"
+        friend_emb_file = "friend_train_embeddings.pt"
+        friend_lab_file = "friend_train_labels.pt"
+        if os.path.exists(user_emb_file) and os.path.exists(friend_emb_file):
+            print("Loading pre-computed embeddings...")
+            X_user = torch.load(user_emb_file)
+            Y_user = torch.load(user_lab_file)
+            X_friend = torch.load(friend_emb_file)
+            Y_friend = torch.load(friend_lab_file)
+            X = torch.cat([X_user, X_friend])
+            Y = torch.cat([Y_user, Y_friend])
+        else:
+            print("Pre-computed embeddings not found, embedding both parts...")
+            X_user, Y_user = process_pids(user_pids, "user")
+            X_friend, Y_friend = process_pids(friend_pids, "friend")
+            X = torch.cat([X_user, X_friend])
+            Y = torch.cat([Y_user, Y_friend])
+    
     model = GOModel(X.shape[1], Y.shape[1]).to(DEVICE)
     opt = torch.optim.Adam(model.parameters(), lr=1e-4)
     loss_fn = nn.BCELoss()
