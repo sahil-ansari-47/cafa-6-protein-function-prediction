@@ -84,7 +84,7 @@ class ProtT5Embedder:
         tokens = self.tokenizer(seq, return_tensors="pt")
         with torch.no_grad():
             out = self.model(**{k: v.to(DEVICE) for k, v in tokens.items()})
-        emb = out.last_hidden_state.mean(dim=1)
+        emb = out.last_hidden_state.mean(dim=1).float()
         return emb[0].cpu()
 # =========================
 # MODEL
@@ -99,7 +99,7 @@ class GOModel(nn.Module):
             nn.Linear(2048, out_dim)
         )
     def forward(self, x):
-        return torch.sigmoid(self.net(x))
+        return self.net(x)
 # =========================
 # MAIN
 # =========================
@@ -127,7 +127,7 @@ def main():
     valid_pids = [p for p in train_seqs if p in train_terms]
     valid_pids.sort(key=lambda x: len(train_seqs[x]), reverse=True)
     # Split valid_pids: 30% for user, 70% for friend
-    split_idx = int(0.7 * len(valid_pids))
+    split_idx = int(0.4 * len(valid_pids))
     friend_pids = valid_pids[:split_idx]
     user_pids = valid_pids[split_idx:]
     print(f"User will embed {len(user_pids)} sequences, friend will embed {len(friend_pids)} sequences")
@@ -246,6 +246,8 @@ def main():
             Y_friend = torch.load(friend_lab_file)
             X = torch.cat([X_user, X_friend])
             Y = torch.cat([Y_user, Y_friend])
+            X = X.float()
+            Y = Y.float()
         else:
             print("Pre-computed embeddings not found, embedding both parts...")
             X_user, Y_user = process_pids(user_pids, "user")
@@ -255,21 +257,34 @@ def main():
     
     model = GOModel(X.shape[1], Y.shape[1]).to(DEVICE)
     opt = torch.optim.Adam(model.parameters(), lr=1e-4)
-    loss_fn = nn.BCELoss()
+    # Compute class frequencies
+    pos_counts = Y.sum(dim=0)  # Number of positive samples per class
+    neg_counts = (1 - Y).sum(dim=0)  # Number of negative samples per class
+    # Avoid division by zero; add small epsilon
+    pos_weight = neg_counts / (pos_counts + 1e-6)
+    # Optionally scale to a reasonable range (e.g., mean around 100 for stability)
+    scaler = 100.0 / pos_weight.mean()
+    pos_weight = pos_weight * scaler
+    pos_weight = pos_weight.to(DEVICE)
+    loss_fn = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
+    batch_size = 32  # Optimized for GPU memory and speed
     print("Training...")
     for epoch in range(5):
         model.train()
         total = 0
-        for i in range(0, len(X), 8):
-            xb = X[i:i+8].to(DEVICE)
-            yb = Y[i:i+8].to(DEVICE)
+        num_batches = 0
+        for i in tqdm(range(0, len(X), batch_size), desc=f"Epoch {epoch+1}/5"):
+            xb = X[i:i+batch_size].to(DEVICE)
+            yb = Y[i:i+batch_size].to(DEVICE)
             pred = model(xb)
             loss = loss_fn(pred, yb)
             opt.zero_grad()
             loss.backward()
             opt.step()
             total += loss.item()
-        print("Epoch", epoch, "loss", total)
+            num_batches += 1
+        avg_loss = total / num_batches
+        print(f"Epoch {epoch+1}, Avg Loss: {avg_loss:.4f}")
     torch.save(model.state_dict(), "model.pt")
     print("Predicting test set...")
     test_seqs = read_fasta("test/testsuperset.fasta")
