@@ -2,112 +2,14 @@ import torch
 import torch.nn as nn
 import numpy as np
 from tqdm import tqdm
-from transformers import T5Tokenizer, T5EncoderModel
 import argparse
-print("Using cuda:", torch.cuda.is_available())
-DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
-PROTT5 = "Rostlab/prot_t5_xl_uniref50"
-# =========================
-# FASTA
-# =========================
-def read_fasta(path):
-    seqs = {}
-    current = None
-    for line in open(path):
-        line = line.strip()
-        if not line: continue
-        if line.startswith(">"):
-            pid = line.split("|")[1] if "|" in line else line[1:].split()[0]
-            current = pid
-            seqs[pid] = ""
-        else:
-            seqs[current] += line.strip()
-    return seqs
-# =========================
-# GO PARSER
-# =========================
-def parse_go_obo(path):
-    parents = {}
-    namespace = {}
-    cur = None
-    for line in open(path):
-        line = line.strip()
-        if line == "[Term]":
-            cur = None
-        elif line.startswith("id:"):
-            cur = line.split("id:")[1].strip()
-            parents[cur] = []
-        elif cur and line.startswith("namespace:"):
-            namespace[cur] = line.split("namespace:")[1].strip()
-        elif cur and line.startswith("is_a:"):
-            p = line.split("is_a:")[1].split("!")[0].strip()
-            parents[cur].append(p)
-    return parents, namespace
-# =========================
-# GO PROPAGATION
-# =========================
-def propagate(scores, parents):
-    out = dict(scores)
-    for go, sc in list(scores.items()):
-        stack = [go]
-        while stack:
-            g = stack.pop()
-            for p in parents.get(g, []):
-                if p not in out or out[p] < sc:
-                    out[p] = sc
-                    stack.append(p)
-    return out
-# =========================
-# DATASET
-# =========================
-def load_train_terms(path):
-    ann = {}
-    for line in open(path):
-        pid, go, ont = line.strip().split("\t")
-        ann.setdefault(pid, set()).add(go)
-    return ann
-# =========================
-# ProtT5 EMBEDDER
-# =========================
-class ProtT5Embedder:
-    def __init__(self):
-        self.tokenizer = T5Tokenizer.from_pretrained(PROTT5, do_lower_case=False)
-        self.model = T5EncoderModel.from_pretrained(
-            PROTT5,
-            use_safetensors=False,
-            weights_only=False,
-            dtype=torch.float16
-        ).to(DEVICE)
-        self.model.eval()
-    def embed(self, seq):
-        seq = " ".join(list(seq))
-        tokens = self.tokenizer(seq, return_tensors="pt")
-        with torch.no_grad():
-            out = self.model(**{k: v.to(DEVICE) for k, v in tokens.items()})
-        emb = out.last_hidden_state.mean(dim=1).float()
-        return emb[0].cpu()
-# =========================
-# MODEL
-# =========================
-class GOModel(nn.Module):
-    def __init__(self, in_dim, out_dim):
-        super().__init__()
-        self.net = nn.Sequential(
-            nn.Linear(in_dim, 2048),
-            nn.ReLU(),
-            nn.Dropout(0.3),
-            nn.Linear(2048, out_dim)
-        )
-    def forward(self, x):
-        return self.net(x)
-# =========================
-# MAIN
-# =========================
+from cafa6_embed import process_pids, DEVICE
+from cafa6_train import GOModel
+from cafa6_parse import read_fasta, parse_go_obo, load_train_terms, propagate
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--role', choices=['user', 'friend', 'both'], default='both', help='Which part to process: user (30%), friend (70%), or both')
-    args = parser.parse_args()
-    
+    args = parser.parse_args()    
     print("Loading GO...")
     parents, namespace = parse_go_obo("Train/go-basic.obo")
     print("Loading train sequences...")
@@ -121,8 +23,9 @@ def main():
     go2idx = {go:i for i,go in enumerate(sorted(all_gos))}
     idx2go = {i:go for go,i in go2idx.items()}
     print("GO terms:", len(go2idx))
+    print("Loading test sequences...")
+    test_seqs = read_fasta("Test/testsuperset.fasta")
     print("Loading ProtT5...")
-    embedder = ProtT5Embedder()
     # 1. Filter valid sequences first
     valid_pids = [p for p in train_seqs if p in train_terms]
     valid_pids.sort(key=lambda x: len(train_seqs[x]), reverse=True)
@@ -131,179 +34,108 @@ def main():
     friend_pids = valid_pids[:split_idx]
     user_pids = valid_pids[split_idx:]
     print(f"User will embed {len(user_pids)} sequences, friend will embed {len(friend_pids)} sequences")
-    def process_pids(pids, prefix):
-        X_list = []
-        Y_list = []
-        max_tokens_per_batch = 1000
-        batch_seqs = []
-        batch_pids = []
-        current_tokens = 0
-        print(f"Embedding {len(pids)} sequences for {prefix} with dynamic batching...")
-        for pid in tqdm(pids):
-            seq = train_seqs[pid]
-            seq_len = len(seq)  # Approximate tokens
-            if current_tokens + seq_len > max_tokens_per_batch and batch_seqs:
-                # Process current batch
-                try:
-                    batch_seqs_formatted = [" ".join(list(s)) for s in batch_seqs]
-                    tokens = embedder.tokenizer(
-                        batch_seqs_formatted, 
-                        return_tensors="pt", 
-                        padding=True, 
-                        truncation=True, 
-                        max_length=1024
-                    )
-                    with torch.no_grad():
-                        input_ids = tokens['input_ids'].to(DEVICE)
-                        attention_mask = tokens['attention_mask'].to(DEVICE)
-                        out = embedder.model(input_ids=input_ids, attention_mask=attention_mask)
-                        embeddings = out.last_hidden_state
-                        mask_expanded = attention_mask.unsqueeze(-1).expand(embeddings.size()).float()
-                        sum_embeddings = torch.sum(embeddings * mask_expanded, 1)
-                        sum_mask = torch.clamp(mask_expanded.sum(1), min=1e-9)
-                        batch_embeddings = sum_embeddings / sum_mask
-                        X_list.append(batch_embeddings.cpu())
-                        for pid in batch_pids:
-                            y = torch.zeros(len(go2idx))
-                            for go in train_terms[pid]:
-                                if go in go2idx:
-                                    y[go2idx[go]] = 1.0
-                            Y_list.append(y)
-                except RuntimeError as e:
-                    if "out of memory" in str(e):
-                        print(f"Skipping batch due to OOM")
-                        torch.cuda.empty_cache()
-                    else:
-                        raise e
-                # Reset batch
-                batch_seqs = []
-                batch_pids = []
-                current_tokens = 0
-            batch_seqs.append(seq)
-            batch_pids.append(pid)
-            current_tokens += seq_len
-        # Process remaining batch
-        if batch_seqs:
-            try:
-                batch_seqs_formatted = [" ".join(list(s)) for s in batch_seqs]
-                tokens = embedder.tokenizer(
-                    batch_seqs_formatted, 
-                    return_tensors="pt", 
-                    padding=True, 
-                    truncation=True, 
-                    max_length=1024
-                )
-                with torch.no_grad():
-                    input_ids = tokens['input_ids'].to(DEVICE)
-                    attention_mask = tokens['attention_mask'].to(DEVICE)
-                    out = embedder.model(input_ids=input_ids, attention_mask=attention_mask)
-                    embeddings = out.last_hidden_state
-                    mask_expanded = attention_mask.unsqueeze(-1).expand(embeddings.size()).float()
-                    sum_embeddings = torch.sum(embeddings * mask_expanded, 1)
-                    sum_mask = torch.clamp(mask_expanded.sum(1), min=1e-9)
-                    batch_embeddings = sum_embeddings / sum_mask
-                    X_list.append(batch_embeddings.cpu())
-                    for pid in batch_pids:
-                        y = torch.zeros(len(go2idx))
-                        for go in train_terms[pid]:
-                            if go in go2idx:
-                                y[go2idx[go]] = 1.0
-                        Y_list.append(y)
-            except RuntimeError as e:
-                if "out of memory" in str(e):
-                    print(f"Skipping final batch due to OOM")
-                    torch.cuda.empty_cache()
-                else:
-                    raise e
-        # Stack results
-        X = torch.cat(X_list)
-        Y = torch.stack(Y_list)
-        print(f"{prefix} size:", X.shape)
-        # Save
-        torch.save(X, f"{prefix}_train_embeddings.pt")
-        torch.save(Y, f"{prefix}_train_labels.pt")
-        return X, Y
+    # Split test sequences similarly
+    test_pids = list(test_seqs.keys())
+    test_pids.sort(key=lambda x: len(test_seqs[x]), reverse=True)
+    split_idx = int(0.4 * len(test_pids))
+    friend_test_pids = test_pids[:split_idx]
+    user_test_pids = test_pids[split_idx:]
+    print(f"Friend test: {len(friend_test_pids)}, User test: {len(user_test_pids)}")
     
-    if args.role == 'user':
-        X_user, Y_user = process_pids(user_pids, "user")
-        print("Embedding done for user. Skipping training.")
-        return  # Exit without training
-    elif args.role == 'friend':
-        X_friend, Y_friend = process_pids(friend_pids, "friend")
-        print("Embedding done for friend. Skipping training.")
-        return  # Exit without training
-    else:  # both
-        import os
-        user_emb_file = "user_train_embeddings.pt"
-        user_lab_file = "user_train_labels.pt"
-        friend_emb_file = "friend_train_embeddings.pt"
-        friend_lab_file = "friend_train_labels.pt"
-        if os.path.exists(user_emb_file) and os.path.exists(friend_emb_file):
-            print("Loading pre-computed embeddings...")
-            X_user = torch.load(user_emb_file)
-            Y_user = torch.load(user_lab_file)
-            X_friend = torch.load(friend_emb_file)
-            Y_friend = torch.load(friend_lab_file)
+    # Create all embeddings if not exist
+    import os
+    if not os.path.exists("user_train_embeddings.pt"):
+        process_pids(user_pids, "user_train", train_seqs, train_terms, go2idx)
+    if not os.path.exists("friend_train_embeddings.pt"):
+        process_pids(friend_pids, "friend_train", train_seqs, train_terms, go2idx)
+    if not os.path.exists("friend_test_embeddings.pt"):
+        process_pids(friend_test_pids, "friend_test", test_seqs)
+    if not os.path.exists("user_test_embeddings.pt"):
+        process_pids(user_test_pids, "user_test", test_seqs)
+    
+    # Now, for training if role == 'both'
+    if args.role == 'both':
+        if not os.path.exists("model.pt"):
+            print("Loading train embeddings...")
+            X_user = torch.load("user_train_embeddings.pt")
+            Y_user = torch.load("user_train_labels.pt")
+            X_friend = torch.load("friend_train_embeddings.pt")
+            Y_friend = torch.load("friend_train_labels.pt")
             X = torch.cat([X_user, X_friend])
             Y = torch.cat([Y_user, Y_friend])
             X = X.float()
             Y = Y.float()
+            # Create model
+            input_dim = 1024  # ProtT5 XL output dimension
+            model = GOModel(input_dim, len(go2idx)).to(DEVICE)
+            # Compute pos_weight and train
+            pos_counts = Y.sum(dim=0)
+            neg_counts = (1 - Y).sum(dim=0)
+            pos_weight = neg_counts / (pos_counts + 1e-6)
+            scaler = 100.0 / pos_weight.mean()
+            pos_weight = pos_weight * scaler
+            pos_weight = pos_weight.to(DEVICE)
+            loss_fn = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
+            batch_size = 32
+            print("Training...")
+            for epoch in range(5):
+                model.train()
+                total = 0
+                num_batches = 0
+                for i in tqdm(range(0, len(X), batch_size), desc=f"Epoch {epoch+1}/5"):
+                    xb = X[i:i+batch_size].to(DEVICE)
+                    yb = Y[i:i+batch_size].to(DEVICE)
+                    pred = model(xb)
+                    loss = loss_fn(pred, yb)
+                    opt = torch.optim.Adam(model.parameters(), lr=1e-4)
+                    opt.zero_grad()
+                    loss.backward()
+                    opt.step()
+                    total += loss.item()
+                    num_batches += 1
+                avg_loss = total / num_batches
+                print(f"Epoch {epoch+1}, Avg Loss: {avg_loss:.4f}")
+            torch.save(model.state_dict(), "model.pt")
         else:
-            print("Pre-computed embeddings not found, embedding both parts...")
-            X_user, Y_user = process_pids(user_pids, "user")
-            X_friend, Y_friend = process_pids(friend_pids, "friend")
-            X = torch.cat([X_user, X_friend])
-            Y = torch.cat([Y_user, Y_friend])
+            print("Model already exists, skipping training.")
+    elif args.role == 'user':
+        print("Embedding done for user. Skipping training.")
+    elif args.role == 'friend':
+        print("Embedding done for friend. Skipping training.")
     
-    model = GOModel(X.shape[1], Y.shape[1]).to(DEVICE)
-    opt = torch.optim.Adam(model.parameters(), lr=1e-4)
-    # Compute class frequencies
-    pos_counts = Y.sum(dim=0)  # Number of positive samples per class
-    neg_counts = (1 - Y).sum(dim=0)  # Number of negative samples per class
-    # Avoid division by zero; add small epsilon
-    pos_weight = neg_counts / (pos_counts + 1e-6)
-    # Optionally scale to a reasonable range (e.g., mean around 100 for stability)
-    scaler = 100.0 / pos_weight.mean()
-    pos_weight = pos_weight * scaler
-    pos_weight = pos_weight.to(DEVICE)
-    loss_fn = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
-    batch_size = 32  # Optimized for GPU memory and speed
-    print("Training...")
-    for epoch in range(5):
-        model.train()
-        total = 0
-        num_batches = 0
-        for i in tqdm(range(0, len(X), batch_size), desc=f"Epoch {epoch+1}/5"):
-            xb = X[i:i+batch_size].to(DEVICE)
-            yb = Y[i:i+batch_size].to(DEVICE)
-            pred = model(xb)
-            loss = loss_fn(pred, yb)
-            opt.zero_grad()
-            loss.backward()
-            opt.step()
-            total += loss.item()
-            num_batches += 1
-        avg_loss = total / num_batches
-        print(f"Epoch {epoch+1}, Avg Loss: {avg_loss:.4f}")
-    torch.save(model.state_dict(), "model.pt")
+    # Prediction
     print("Predicting test set...")
-    test_seqs = read_fasta("test/testsuperset.fasta")
-    out = open("submission.tsv", "w")
+    # Load model
+    input_dim = 1024
+    model = GOModel(input_dim, len(go2idx)).to(DEVICE)
+    model.load_state_dict(torch.load("model.pt"))
     model.eval()
-    for pid, seq in tqdm(test_seqs.items()):
-        emb = embedder.embed(seq).unsqueeze(0).to(DEVICE)
+    # Load test embeddings
+    X_friend_test = torch.load("friend_test_embeddings.pt")
+    X_user_test = torch.load("user_test_embeddings.pt")
+    X_test = torch.cat([X_friend_test, X_user_test])
+    test_pids_ordered = friend_test_pids + user_test_pids
+    output_file = "submission.tsv"
+    out = open(output_file, "w")
+    batch_size = 32
+    for i in tqdm(range(0, len(X_test), batch_size), desc="Predicting"):
+        xb = X_test[i:i+batch_size].to(DEVICE)
         with torch.no_grad():
-            pred = model(emb)[0].cpu().numpy()
-        scores = {}
-        for i, sc in enumerate(pred):
-            if sc > 0.01:
-                scores[idx2go[i]] = float(sc)
-        # GO propagation
-        scores = propagate(scores, parents)
-        # write top 100
-        for go, sc in sorted(scores.items(), key=lambda x: -x[1])[:100]:
-            out.write(f"{pid}\t{go}\t{sc:.4f}\n")
+            logits = model(xb)
+            batch_preds = torch.sigmoid(logits).cpu().numpy()
+        for j, pred in enumerate(batch_preds):
+            pid = test_pids_ordered[i + j]
+            scores = {}
+            indices = np.where(pred > 0.01)[0]
+            for idx in indices:
+                scores[idx2go[idx]] = float(pred[idx])
+            # GO propagation
+            scores = propagate(scores, parents)
+            # write top 100
+            for go, sc in sorted(scores.items(), key=lambda x: -x[1])[:100]:
+                out.write(f"{pid}\t{go}\t{sc:.4f}\n")
     out.close()
-    print("Done. Written submission.tsv")
+    print(f"Done. Written {output_file}")
+    
 if __name__ == "__main__":
     main()
