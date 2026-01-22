@@ -3,4 +3,7 @@ user_train_embeddings.pt
 friend_train_embeddings.pt
 user_train_labels.pt
 friend_train_labels.pt
+test_protT5_embeddings.npz
+test_protT5_embeddings.pkl
 model.pt
+__pycache__/
