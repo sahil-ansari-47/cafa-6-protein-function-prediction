@@ -53,7 +53,7 @@ class GODag:
     def get_parents(self, go_id: str) -> Set[str]:
         """Return direct parents of a GO term."""
         return self.parents.get(go_id, set())
-
+    
     def get_ancestors(self, go_id: str) -> Set[str]:
         """Return all ancestors (excluding self)."""
         if go_id in self._ancestor_cache:

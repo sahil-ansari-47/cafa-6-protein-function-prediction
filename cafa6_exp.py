@@ -10,7 +10,6 @@ PROTT5 = "Rostlab/prot_t5_xl_uniref50"
 # =========================
 # FASTA READER
 # =========================
-
 def read_fasta(path):
     seqs = {}
     current = None
