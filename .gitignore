@@ -1,4 +1,5 @@
 venv/
+lvenv/
 user_train_embeddings.pt
 friend_train_embeddings.pt
 user_train_labels.pt
@@ -7,3 +8,6 @@ test_protT5_embeddings.npz
 test_protT5_embeddings.pkl
 model.pt
 __pycache__/
+output/
+Pfam/
+DeepTMHMM-Academic-License-v1.0/
